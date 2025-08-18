@@ -1,33 +1,20 @@
 #!/usr/bin/env python3
 """
-OrderbookFlowImbalance (Optimized Version)
+OrderbookFlowImbalance - Optimized Version
 ==========================================
 
 High-performance Order Flow Imbalance (OFI) calculation for orderbook data.
-Optimized for speed with vectorized operations and optional numba acceleration.
+Optimized with vectorized operations, pre-computed boundaries, and optional numba JIT.
 
 Classes
 -------
 OrderbookFlowImbalance : Compute OFI from OrderBookData
-    Calculates per-level OFI values over time windows.
+    Calculates per-level OFI values over time windows with optimized performance.
 """
 
 import numpy as np
 from typing import Literal, Optional, Tuple
 from datetime import datetime, timezone
-
-# Try to import numba for JIT compilation
-try:
-    from numba import jit, prange
-    HAS_NUMBA = True
-except ImportError:
-    HAS_NUMBA = False
-    # Define dummy decorators if numba is not available
-    def jit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
-    prange = range
 
 # Import OrderBookData from the user's codebase
 try:
@@ -40,126 +27,140 @@ except ImportError:
             "Failed to import OrderBookData. Ensure OrderBookDS/OrderBookDS.py is on sys.path."
         ) from e
 
+# Optional numba import for JIT compilation
+try:
+    from numba import jit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    # Define no-op decorators
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
 
-@jit(nopython=True, cache=True, parallel=True)
-def _compute_window_ofi_vectorized(
+
+@jit(nopython=True, parallel=True, cache=True)
+def _compute_ofi_vectorized_numba(
     buy_prices: np.ndarray,
     buy_volumes: np.ndarray, 
     sell_prices: np.ndarray,
     sell_volumes: np.ndarray,
     window_starts: np.ndarray,
     window_ends: np.ndarray,
-    out_ofi: np.ndarray,
     eps: float = 1e-12
-) -> None:
+) -> np.ndarray:
     """
-    Vectorized OFI computation for multiple windows using numba.
+    Numba-optimized OFI computation for all windows.
     
     Parameters
     ----------
     buy_prices, buy_volumes, sell_prices, sell_volumes : ndarray
-        Full data arrays
+        Price and volume data, shape (n_samples, n_levels)
     window_starts, window_ends : ndarray
         Start and end indices for each window
-    out_ofi : ndarray
-        Output array to store OFI values (modified in-place)
     eps : float
         Small value to avoid division by zero
-    """
-    n_windows = len(window_starts)
-    n_levels = buy_prices.shape[1]
-    
-    for w in prange(n_windows):
-        start_idx = window_starts[w]
-        end_idx = window_ends[w]
-        
-        if end_idx - start_idx < 2:
-            # Not enough data points
-            for j in range(n_levels):
-                out_ofi[w, j] = 0.0
-            continue
-        
-        # Calculate OFI for each level
-        for j in range(n_levels):
-            ofi_sum = 0.0
-            total_volume = 0.0
-            
-            # Process each consecutive pair in the window
-            for i in range(start_idx, end_idx - 1):
-                # Price changes
-                dpb = buy_prices[i + 1, j] - buy_prices[i, j]
-                dps = sell_prices[i + 1, j] - sell_prices[i, j]
-                
-                # Buy side contributions
-                if dpb >= 0:
-                    ofi_sum += buy_volumes[i + 1, j]
-                if dpb <= 0:
-                    ofi_sum -= buy_volumes[i, j]
-                
-                # Sell side contributions
-                if dps <= 0:
-                    ofi_sum -= sell_volumes[i + 1, j]
-                if dps >= 0:
-                    ofi_sum += sell_volumes[i, j]
-            
-            # Calculate total volume for normalization
-            for i in range(start_idx, end_idx):
-                total_volume += buy_volumes[i, j] + sell_volumes[i, j]
-            
-            # Normalize
-            Q = total_volume / (2.0 * n_levels)
-            if Q > eps:
-                out_ofi[w, j] = ofi_sum / Q
-            else:
-                out_ofi[w, j] = 0.0
-
-
-@jit(nopython=True, cache=True)
-def _precompute_window_boundaries_time_driven(
-    timestamps: np.ndarray,
-    lookback_interval: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Precompute window start indices for all timestamps.
-    
-    Parameters
-    ----------
-    timestamps : ndarray
-        Array of timestamps
-    lookback_interval : int
-        Lookback window in milliseconds
         
     Returns
     -------
-    window_starts : ndarray
-        Start indices for each window
-    window_ends : ndarray
-        End indices for each window (exclusive)
+    ofi : ndarray
+        OFI values, shape (n_windows, n_levels)
     """
-    n_samples = len(timestamps)
-    window_starts = np.empty(n_samples, dtype=np.int64)
-    window_ends = np.arange(1, n_samples + 1, dtype=np.int64)
+    n_windows = len(window_starts)
+    n_levels = buy_prices.shape[1]
+    ofi_result = np.zeros((n_windows, n_levels), dtype=np.float32)
     
-    # Use two-pointer technique for O(n) complexity
-    start_idx = 0
-    
-    for i in range(n_samples):
-        window_start_time = timestamps[i] - lookback_interval
+    for i in prange(n_windows):
+        start = window_starts[i]
+        end = window_ends[i]
         
-        # Move start_idx forward until we find the window start
-        while start_idx < i and timestamps[start_idx] < window_start_time:
-            start_idx += 1
+        if end - start < 2:
+            continue
+            
+        # Calculate price changes
+        dpb = buy_prices[start+1:end] - buy_prices[start:end-1]
+        dps = sell_prices[start+1:end] - sell_prices[start:end-1]
         
-        window_starts[i] = start_idx
+        # Calculate OFI components
+        ofi_buy_pos = np.sum(buy_volumes[start+1:end] * (dpb >= 0), axis=0)
+        ofi_buy_neg = np.sum(buy_volumes[start:end-1] * (dpb <= 0), axis=0)
+        ofi_sell_neg = np.sum(sell_volumes[start+1:end] * (dps <= 0), axis=0)
+        ofi_sell_pos = np.sum(sell_volumes[start:end-1] * (dps >= 0), axis=0)
+        
+        ofi = ofi_buy_pos - ofi_buy_neg - ofi_sell_neg + ofi_sell_pos
+        
+        # Normalization
+        total_volume = np.sum(buy_volumes[start:end]) + np.sum(sell_volumes[start:end])
+        Q = total_volume / (2.0 * n_levels)
+        
+        if Q > eps:
+            ofi_result[i] = ofi / Q
+            
+    return ofi_result
+
+
+def _compute_ofi_vectorized_numpy(
+    buy_prices: np.ndarray,
+    buy_volumes: np.ndarray,
+    sell_prices: np.ndarray,
+    sell_volumes: np.ndarray,
+    window_starts: np.ndarray,
+    window_ends: np.ndarray,
+    eps: float = 1e-12
+) -> np.ndarray:
+    """
+    Numpy-vectorized OFI computation for all windows.
+    """
+    n_windows = len(window_starts)
+    n_levels = buy_prices.shape[1]
+    ofi_result = np.zeros((n_windows, n_levels), dtype=np.float32)
     
-    return window_starts, window_ends
+    # Process in batches for better cache efficiency
+    batch_size = min(1000, n_windows)
+    
+    for batch_start in range(0, n_windows, batch_size):
+        batch_end = min(batch_start + batch_size, n_windows)
+        
+        for i in range(batch_start, batch_end):
+            start = window_starts[i]
+            end = window_ends[i]
+            
+            if end - start < 2:
+                continue
+            
+            # Slice once and reuse
+            buy_p_window = buy_prices[start:end]
+            buy_v_window = buy_volumes[start:end]
+            sell_p_window = sell_prices[start:end]
+            sell_v_window = sell_volumes[start:end]
+            
+            # Calculate price changes
+            dpb = buy_p_window[1:] - buy_p_window[:-1]
+            dps = sell_p_window[1:] - sell_p_window[:-1]
+            
+            # Vectorized OFI calculation
+            ofi = (
+                np.sum(buy_v_window[1:] * (dpb >= 0), axis=0) -
+                np.sum(buy_v_window[:-1] * (dpb <= 0), axis=0) -
+                np.sum(sell_v_window[1:] * (dps <= 0), axis=0) +
+                np.sum(sell_v_window[:-1] * (dps >= 0), axis=0)
+            )
+            
+            # Normalization
+            total_volume = np.sum(buy_v_window) + np.sum(sell_v_window)
+            Q = total_volume / (2.0 * n_levels)
+            
+            if Q > eps:
+                ofi_result[i] = ofi / Q
+                
+    return ofi_result
 
 
 class OrderbookFlowImbalance:
     """
-    Compute per-level Order Flow Imbalance (OFI) vectors from orderbook data.
-    
-    Optimized version with vectorized operations and optional numba acceleration.
+    Optimized Order Flow Imbalance (OFI) calculator with performance enhancements.
     
     Parameters
     ----------
@@ -172,7 +173,9 @@ class OrderbookFlowImbalance:
     lookback_interval : int
         Window size: milliseconds for time_driven mode, snapshot count for event_driven mode.
     train_interval : int, optional
-        Reserved for future use. Same units as lookback_interval.
+        Grouping interval for OFI vectors:
+        - time_driven: milliseconds for time-based grouping
+        - event_driven: number of samples per group
     dtype : np.dtype, optional
         Data type for OFI calculations. Default is np.float32.
     use_numba : bool, optional
@@ -198,9 +201,8 @@ class OrderbookFlowImbalance:
                  lookback_interval: int = 1000,
                  train_interval: Optional[int] = None,
                  dtype: np.dtype = np.float32,
-                 round_volume_down: bool = True,
                  use_numba: bool = True):
-        """Initialize OFI computation."""
+        """Initialize OFI computation with optimizations."""
         
         # Validate mode
         if mode not in ['time_driven', 'event_driven']:
@@ -210,28 +212,41 @@ class OrderbookFlowImbalance:
         self._obData = obData
         self._mode = mode
         self._lookback_interval = lookback_interval  # milliseconds or snapshots
-        self._train_interval = train_interval  # reserved for future use
+        self._train_interval = train_interval  # milliseconds or snapshots for grouping
         self._dtype = dtype
-        self._round_volume_down = round_volume_down
         self._use_numba = use_numba and HAS_NUMBA
         
-        # Extract data from OrderBookData - convert to contiguous arrays for better performance
+        # Extract data from OrderBookData - ensure contiguous arrays for performance
         self._timestamps = np.ascontiguousarray(obData.timestamps, dtype=np.int64)
-        self._buy_prices = np.ascontiguousarray(obData.buyPrices, dtype=self._dtype)
-        self._buy_volumes = np.ascontiguousarray(obData.buyVolumes, dtype=self._dtype)
-        self._sell_prices = np.ascontiguousarray(obData.sellPrices, dtype=self._dtype)
-        self._sell_volumes = np.ascontiguousarray(obData.sellVolumes, dtype=self._dtype)
+        self._buy_prices = np.ascontiguousarray(obData.buyPrices, dtype=dtype)
+        self._buy_volumes = np.ascontiguousarray(obData.buyVolumes, dtype=dtype)
+        self._sell_prices = np.ascontiguousarray(obData.sellPrices, dtype=dtype)
+        self._sell_volumes = np.ascontiguousarray(obData.sellVolumes, dtype=dtype)
         self._num_samples = obData.numSnapshots
         self._num_levels = obData.numLevels
         
-        # Initialize OFI storage
+        # Pre-allocate OFI storage
         self._ofi = np.zeros((self._num_samples, self._num_levels), dtype=self._dtype)
         
         # Track sampled indices for event-driven mode
         self._sampled_indices = np.array([], dtype=np.int64)
         
+        # Pre-compute window boundaries for efficiency
+        self._window_starts = None
+        self._window_ends = None
+        
+        # Grouping information
+        self._groups = None
+        self._group_boundaries = None
+        self._grid_start_time = None
+        self._grid_end_time = None
+        
         # Compute OFI
         self._compute_ofi()
+        
+        # Compute grouping if train_interval is specified
+        if self._train_interval is not None:
+            self._compute_groups()
         
         # Log summary
         unit = "ms" if mode == 'time_driven' else "snapshots"
@@ -250,92 +265,35 @@ class OrderbookFlowImbalance:
     
     def _compute_ofi_time_driven_optimized(self):
         """
-        Optimized OFI computation for time-driven mode.
-        Precomputes window boundaries and uses vectorized operations.
+        Optimized time-driven OFI computation with pre-computed boundaries.
         """
+        # Pre-compute all window boundaries at once
+        window_indices = np.arange(self._num_samples)
+        window_start_times = self._timestamps - self._lookback_interval
+        
+        # Vectorized searchsorted for all windows
+        self._window_starts = np.searchsorted(self._timestamps, window_start_times, side='right')
+        self._window_ends = window_indices + 1
+        
+        # Choose computation method
         if self._use_numba:
-            # Use numba-optimized version
-            window_starts, window_ends = _precompute_window_boundaries_time_driven(
-                self._timestamps, self._lookback_interval
-            )
-            
-            _compute_window_ofi_vectorized(
-                self._buy_prices,
-                self._buy_volumes,
-                self._sell_prices,
-                self._sell_volumes,
-                window_starts,
-                window_ends,
-                self._ofi
+            ofi_values = _compute_ofi_vectorized_numba(
+                self._buy_prices, self._buy_volumes,
+                self._sell_prices, self._sell_volumes,
+                self._window_starts, self._window_ends
             )
         else:
-            # Fall back to numpy vectorized version
-            self._compute_ofi_time_driven_numpy()
-    
-    def _compute_ofi_time_driven_numpy(self):
-        """
-        Numpy-based vectorized OFI computation for time-driven mode.
-        """
-        # Precompute window boundaries
-        window_starts = np.searchsorted(
-            self._timestamps, 
-            self._timestamps - self._lookback_interval, 
-            side='right'
-        )
+            ofi_values = _compute_ofi_vectorized_numpy(
+                self._buy_prices, self._buy_volumes,
+                self._sell_prices, self._sell_volumes,
+                self._window_starts, self._window_ends
+            )
         
-        # Process in batches for better memory efficiency
-        batch_size = min(1000, self._num_samples)
-        
-        for batch_start in range(0, self._num_samples, batch_size):
-            batch_end = min(batch_start + batch_size, self._num_samples)
-            
-            for i in range(batch_start, batch_end):
-                start_idx = window_starts[i]
-                end_idx = i + 1
-                
-                if end_idx - start_idx < 2:
-                    self._ofi[i, :] = 0.0
-                    continue
-                
-                # Vectorized OFI computation for all levels at once
-                self._ofi[i, :] = self._compute_window_ofi_numpy(
-                    start_idx, end_idx
-                )
-    
-    def _compute_window_ofi_numpy(self, start_idx: int, end_idx: int) -> np.ndarray:
-        """
-        Numpy-vectorized OFI computation for a single window.
-        """
-        # Extract window data (views, no copy)
-        buy_prices = self._buy_prices[start_idx:end_idx]
-        buy_volumes = self._buy_volumes[start_idx:end_idx]
-        sell_prices = self._sell_prices[start_idx:end_idx]
-        sell_volumes = self._sell_volumes[start_idx:end_idx]
-        
-        # Vectorized price changes
-        dpb = np.diff(buy_prices, axis=0)
-        dps = np.diff(sell_prices, axis=0)
-        
-        # Vectorized OFI calculation
-        ofi = (
-            np.sum(buy_volumes[1:] * (dpb >= 0), axis=0) -
-            np.sum(buy_volumes[:-1] * (dpb <= 0), axis=0) -
-            np.sum(sell_volumes[1:] * (dps <= 0), axis=0) +
-            np.sum(sell_volumes[:-1] * (dps >= 0), axis=0)
-        )
-        
-        # Normalization
-        total_volume = buy_volumes.sum() + sell_volumes.sum()
-        Q = total_volume / (2.0 * self._num_levels)
-        
-        if Q > 1e-12:
-            return ofi / Q
-        else:
-            return np.zeros(self._num_levels, dtype=self._dtype)
+        self._ofi = ofi_values
     
     def _compute_ofi_event_driven_optimized(self):
         """
-        Optimized OFI computation for event-driven mode.
+        Optimized event-driven OFI computation.
         """
         K = self._lookback_interval
         
@@ -345,37 +303,26 @@ class OrderbookFlowImbalance:
         if len(self._sampled_indices) == 0:
             return
         
-        # Prepare window boundaries for all sampled indices
-        window_starts = np.maximum(0, self._sampled_indices - K + 1)
-        window_ends = self._sampled_indices + 1
+        # Pre-compute window boundaries
+        self._window_starts = np.maximum(0, self._sampled_indices - K + 1)
+        self._window_ends = self._sampled_indices + 1
         
+        # Compute OFI for sampled windows
         if self._use_numba:
-            # Create output array for sampled indices only
-            sampled_ofi = np.zeros((len(self._sampled_indices), self._num_levels), dtype=self._dtype)
-            
-            _compute_window_ofi_vectorized(
-                self._buy_prices,
-                self._buy_volumes,
-                self._sell_prices,
-                self._sell_volumes,
-                window_starts,
-                window_ends,
-                sampled_ofi
+            sampled_ofi = _compute_ofi_vectorized_numba(
+                self._buy_prices, self._buy_volumes,
+                self._sell_prices, self._sell_volumes,
+                self._window_starts, self._window_ends
             )
-            
-            # Copy results to main OFI array
-            self._ofi[self._sampled_indices] = sampled_ofi
         else:
-            # Numpy version
-            for idx, i in enumerate(self._sampled_indices):
-                start_idx = window_starts[idx]
-                end_idx = window_ends[idx]
-                
-                if end_idx - start_idx < 2:
-                    self._ofi[i, :] = 0.0
-                    continue
-                
-                self._ofi[i, :] = self._compute_window_ofi_numpy(start_idx, end_idx)
+            sampled_ofi = _compute_ofi_vectorized_numpy(
+                self._buy_prices, self._buy_volumes,
+                self._sell_prices, self._sell_volumes,
+                self._window_starts, self._window_ends
+            )
+        
+        # Place results at sampled indices
+        self._ofi[self._sampled_indices] = sampled_ofi
     
     def _process_time_boundaries(self):
         """
@@ -469,11 +416,155 @@ class OrderbookFlowImbalance:
         # Reset OFI array and sampled indices
         self._ofi = np.zeros((self._num_samples, self._num_levels), dtype=self._dtype)
         self._sampled_indices = np.array([], dtype=np.int64)
+        self._window_starts = None
+        self._window_ends = None
+        self._groups = None
+        self._group_boundaries = None
+        self._grid_start_time = None
+        self._grid_end_time = None
         
         # Recompute
         self._compute_ofi()
+        
+        # Recompute grouping if train_interval is specified
+        if self._train_interval is not None:
+            self._compute_groups()
         
         # Log summary
         unit = "ms" if self._mode == 'time_driven' else "snapshots"
         print(f"OFI recomputed: mode={self._mode}, L={self._num_samples}, "
               f"n={self._num_levels}, lookback_interval={self._lookback_interval}{unit}")
+    
+    def _compute_groups(self):
+        """
+        Compute grouping of OFI vectors based on train_interval.
+        
+        For time_driven mode:
+        - Aligns to day boundaries (00:00:00.000)
+        - Creates time grid with train_interval spacing
+        
+        For event_driven mode:
+        - Groups by fixed number of samples
+        """
+        if self._mode == 'time_driven':
+            self._compute_time_driven_groups()
+        else:
+            self._compute_event_driven_groups()
+    
+    def _compute_time_driven_groups(self):
+        """
+        Compute time-based grouping aligned to day boundaries.
+        """
+        # Get day-aligned boundaries
+        self._grid_start_time, self._grid_end_time = self._process_time_boundaries()
+        
+        # Create time grid
+        grid_times = np.arange(
+            self._grid_start_time,
+            self._grid_end_time + self._train_interval,
+            self._train_interval,
+            dtype=np.int64
+        )
+        
+        # Assign each sample to a group
+        self._groups = np.searchsorted(grid_times, self._timestamps, side='right') - 1
+        self._group_boundaries = grid_times
+        
+        # Log grouping info
+        n_groups = len(grid_times) - 1
+        print(f"Time-driven grouping: {n_groups} groups, "
+              f"grid from {self._grid_start_time} to {self._grid_end_time}, "
+              f"interval={self._train_interval}ms")
+    
+    def _compute_event_driven_groups(self):
+        """
+        Compute event-based grouping by sample count.
+        """
+        # Group by fixed number of samples
+        self._groups = np.arange(self._num_samples) // self._train_interval
+        
+        # Compute group boundaries (sample indices)
+        n_groups = self._groups[-1] + 1 if self._num_samples > 0 else 0
+        self._group_boundaries = np.arange(n_groups + 1) * self._train_interval
+        
+        # Log grouping info
+        print(f"Event-driven grouping: {n_groups} groups, "
+              f"{self._train_interval} samples per group")
+    
+    def get_group_by_timestamp(self, timestamp: int) -> Optional[int]:
+        """
+        Get the group number for a given timestamp.
+        
+        Parameters
+        ----------
+        timestamp : int
+            Timestamp in milliseconds
+            
+        Returns
+        -------
+        group : int or None
+            Group number (0-indexed), or None if timestamp is out of range
+        """
+        if self._groups is None:
+            raise ValueError("No grouping computed. Set train_interval to enable grouping.")
+        
+        if self._mode == 'time_driven':
+            # For time-driven, use the time grid
+            if timestamp < self._grid_start_time or timestamp >= self._grid_end_time:
+                return None
+            group = (timestamp - self._grid_start_time) // self._train_interval
+            return int(group)
+        else:
+            # For event-driven, find the sample index first
+            idx = np.searchsorted(self._timestamps, timestamp, side='left')
+            if idx >= self._num_samples:
+                return None
+            # If exact match or within tolerance
+            if idx < self._num_samples and abs(self._timestamps[idx] - timestamp) < 1:
+                return int(self._groups[idx])
+            return None
+    
+    def get_group_ofi(self, group_id: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get all OFI vectors and timestamps for a specific group.
+        
+        Parameters
+        ----------
+        group_id : int
+            Group number (0-indexed)
+            
+        Returns
+        -------
+        ofi_vectors : ndarray
+            OFI values for the group, shape (n_samples_in_group, n_levels)
+        timestamps : ndarray
+            Timestamps for the group
+        """
+        if self._groups is None:
+            raise ValueError("No grouping computed. Set train_interval to enable grouping.")
+        
+        # Find samples in this group
+        mask = self._groups == group_id
+        group_indices = np.where(mask)[0]
+        
+        if len(group_indices) == 0:
+            return np.array([]), np.array([])
+        
+        return self._ofi[group_indices], self._timestamps[group_indices]
+    
+    @property
+    def groups(self) -> Optional[np.ndarray]:
+        """Return group assignments for each sample."""
+        return self._groups
+    
+    @property
+    def group_boundaries(self) -> Optional[np.ndarray]:
+        """Return group boundaries (time points or sample indices)."""
+        return self._group_boundaries
+    
+    @property
+    def num_groups(self) -> Optional[int]:
+        """Return total number of groups."""
+        if self._groups is None:
+            return None
+        return int(np.max(self._groups) + 1) if len(self._groups) > 0 else 0
