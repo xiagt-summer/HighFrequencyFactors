@@ -595,6 +595,42 @@ class OrderbookFlowImbalance:
             return None
         return int(np.max(self._groups) + 1) if len(self._groups) > 0 else 0
     
+    def get_group_info(self, group_id: int) -> Tuple[int, int]:
+        """
+        Get the left and right sample indices for a specific group.
+        
+        Parameters
+        ----------
+        group_id : int
+            Group number (0-indexed)
+            
+        Returns
+        -------
+        left_index : int
+            First sample index in the group
+        right_index : int
+            Last sample index in the group
+        """
+        if self._groups is None:
+            raise ValueError("No grouping computed. Set train_interval to enable grouping.")
+        
+        if group_id < 0 or group_id >= self.num_groups:
+            raise ValueError(f"Invalid group_id {group_id}. Must be in range [0, {self.num_groups})")
+        
+        # Find samples in this group
+        mask = self._groups == group_id
+        group_indices = np.where(mask)[0]
+        
+        if len(group_indices) == 0:
+            # Empty group - return (-1, -1) to indicate no samples
+            return -1, -1
+        
+        # Get sample indices
+        left_index = int(group_indices[0])
+        right_index = int(group_indices[-1])
+        
+        return left_index, right_index
+    
     def _compute_integrated_ofi(self):
         """
         Compute integrated OFI using PCA on each group's OFI vectors.
