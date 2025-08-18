@@ -648,9 +648,9 @@ class OrderbookFlowImbalance:
             try:
                 U, S, Vt = np.linalg.svd(centered_ofi, full_matrices=False)
                 
-                # First principal component (normalized)
+                # First principal component (normalized with L1 norm)
                 pc1 = Vt[0]  # First row of Vt
-                pc1 = pc1 / np.linalg.norm(pc1)  # Normalize
+                pc1 = pc1 / np.sum(np.abs(pc1))  # L1 normalization
                 
                 # Explained variance ratio
                 total_variance = np.sum(S**2)
