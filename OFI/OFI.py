@@ -248,7 +248,8 @@ class OrderbookFlowImbalance:
         self._grid_end_time = None
         
         # Integrated OFI information
-        self._integrated_ofi = None
+        self._integrated_ofi_outsample = None  # Using previous group's PC
+        self._integrated_ofi_insample = None   # Using current group's PC
         self._pca_w1 = None  # Principal component vectors for each group
         self._pca_explained_variance = None  # Explained variance for each group
         
@@ -442,7 +443,8 @@ class OrderbookFlowImbalance:
         self._compute_ofi()
         
         # Reset integrated OFI
-        self._integrated_ofi = None
+        self._integrated_ofi_outsample = None
+        self._integrated_ofi_insample = None
         self._pca_w1 = None
         self._pca_explained_variance = None
         
@@ -600,9 +602,9 @@ class OrderbookFlowImbalance:
         For each group:
         1. Perform PCA/SVD on the group's OFI vectors
         2. Extract the first principal component (normalized)
-        3. Use previous group's PC to compute integrated OFI
-        
-        The first group's integrated OFI is set to 0.
+        3. Compute both in-sample and out-of-sample integrated OFI:
+           - Out-of-sample: Use previous group's PC (first group set to 0)
+           - In-sample: Use current group's PC
         """
         if self._groups is None:
             raise ValueError("Cannot compute integrated OFI without grouping. Set train_interval.")
@@ -612,7 +614,8 @@ class OrderbookFlowImbalance:
             return
         
         # Initialize storage
-        self._integrated_ofi = np.zeros(self._num_samples, dtype=self._dtype)
+        self._integrated_ofi_outsample = np.zeros(self._num_samples, dtype=self._dtype)
+        self._integrated_ofi_insample = np.zeros(self._num_samples, dtype=self._dtype)
         self._pca_w1 = []
         self._pca_explained_variance = []
         
@@ -666,16 +669,23 @@ class OrderbookFlowImbalance:
                 continue
             
             # Compute integrated OFI for this group
+            # In-sample: Use current group's principal component
+            if len(self._pca_w1) > group_id:  # Make sure we have the PC
+                current_pc1 = self._pca_w1[group_id]
+                for idx in group_indices:
+                    self._integrated_ofi_insample[idx] = np.dot(current_pc1, self._ofi[idx])
+            
+            # Out-of-sample: Use previous group's principal component
             if group_id == 0:
                 # First group: set to 0
-                self._integrated_ofi[group_indices] = 0.0
+                self._integrated_ofi_outsample[group_indices] = 0.0
             else:
                 # Use previous group's principal component
                 prev_pc1 = self._pca_w1[group_id - 1]
                 
                 # Compute integrated OFI: pc1_{i-1}^T . ofi_{i,j}
                 for idx in group_indices:
-                    self._integrated_ofi[idx] = np.dot(prev_pc1, self._ofi[idx])
+                    self._integrated_ofi_outsample[idx] = np.dot(prev_pc1, self._ofi[idx])
         
         # Convert lists to arrays for easier access
         self._pca_w1 = np.array(self._pca_w1)
@@ -685,7 +695,7 @@ class OrderbookFlowImbalance:
         print(f"Integrated OFI computed: {n_groups} groups, "
               f"mean explained variance: {np.mean(self._pca_explained_variance):.3f}")
     
-    def get_integrated_ofi_at(self, i: int) -> Tuple[float, int]:
+    def get_integrated_ofi_at(self, i: int, sample_type: str = 'outsample') -> Tuple[float, int]:
         """
         Get integrated OFI value and timestamp at index i.
         
@@ -693,6 +703,10 @@ class OrderbookFlowImbalance:
         ----------
         i : int
             Index of the sample
+        sample_type : {'outsample', 'insample'}
+            Which integrated OFI to return:
+            - 'outsample': Using previous group's PC (default)
+            - 'insample': Using current group's PC
             
         Returns
         -------
@@ -701,15 +715,20 @@ class OrderbookFlowImbalance:
         timestamp : int
             Timestamp in milliseconds at index i
         """
-        if self._integrated_ofi is None:
+        if self._integrated_ofi_outsample is None:
             raise ValueError("Integrated OFI not computed. Set is_integrated_ofi=True.")
         
         if i < 0 or i >= self._num_samples:
             raise IndexError(f"Index {i} out of range [0, {self._num_samples})")
         
-        return float(self._integrated_ofi[i]), self._timestamps[i]
+        if sample_type == 'outsample':
+            return float(self._integrated_ofi_outsample[i]), self._timestamps[i]
+        elif sample_type == 'insample':
+            return float(self._integrated_ofi_insample[i]), self._timestamps[i]
+        else:
+            raise ValueError(f"Invalid sample_type: {sample_type}. Must be 'outsample' or 'insample'")
     
-    def get_group_integrated_ofi(self, group_id: int) -> Tuple[np.ndarray, np.ndarray]:
+    def get_group_integrated_ofi(self, group_id: int, sample_type: str = 'outsample') -> Tuple[np.ndarray, np.ndarray]:
         """
         Get all integrated OFI values and timestamps for a specific group.
         
@@ -717,6 +736,10 @@ class OrderbookFlowImbalance:
         ----------
         group_id : int
             Group number (0-indexed)
+        sample_type : {'outsample', 'insample'}
+            Which integrated OFI to return:
+            - 'outsample': Using previous group's PC (default)
+            - 'insample': Using current group's PC
             
         Returns
         -------
@@ -725,7 +748,7 @@ class OrderbookFlowImbalance:
         timestamps : ndarray
             Timestamps for the group
         """
-        if self._integrated_ofi is None:
+        if self._integrated_ofi_outsample is None:
             raise ValueError("Integrated OFI not computed. Set is_integrated_ofi=True.")
         
         if self._groups is None:
@@ -738,12 +761,27 @@ class OrderbookFlowImbalance:
         if len(group_indices) == 0:
             return np.array([]), np.array([])
         
-        return self._integrated_ofi[group_indices], self._timestamps[group_indices]
+        if sample_type == 'outsample':
+            return self._integrated_ofi_outsample[group_indices], self._timestamps[group_indices]
+        elif sample_type == 'insample':
+            return self._integrated_ofi_insample[group_indices], self._timestamps[group_indices]
+        else:
+            raise ValueError(f"Invalid sample_type: {sample_type}. Must be 'outsample' or 'insample'")
+    
+    @property
+    def integrated_ofi_outsample(self) -> Optional[np.ndarray]:
+        """Return computed out-of-sample integrated OFI values (using previous group's PC)."""
+        return self._integrated_ofi_outsample
+    
+    @property
+    def integrated_ofi_insample(self) -> Optional[np.ndarray]:
+        """Return computed in-sample integrated OFI values (using current group's PC)."""
+        return self._integrated_ofi_insample
     
     @property
     def integrated_ofi(self) -> Optional[np.ndarray]:
-        """Return computed integrated OFI values."""
-        return self._integrated_ofi
+        """Return computed out-of-sample integrated OFI values (backward compatible)."""
+        return self._integrated_ofi_outsample
     
     @property
     def pca_w1(self) -> Optional[np.ndarray]:
