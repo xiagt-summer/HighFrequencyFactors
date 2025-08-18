@@ -180,10 +180,6 @@ class OrderbookFlowImbalance:
         Data type for OFI calculations. Default is np.float32.
     use_numba : bool, optional
         Whether to use numba JIT compilation if available. Default is True.
-    is_integrated_ofi : bool, optional
-        Whether to compute integrated OFI using PCA. Default is False.
-        If True, performs PCA on each group's OFI vectors and uses the first
-        principal component to compute integrated OFI values.
     
     Attributes
     ----------
@@ -205,8 +201,7 @@ class OrderbookFlowImbalance:
                  lookback_interval: int = 1000,
                  train_interval: Optional[int] = None,
                  dtype: np.dtype = np.float32,
-                 use_numba: bool = True,
-                 is_integrated_ofi: bool = False):
+                 use_numba: bool = True):
         """Initialize OFI computation with optimizations."""
         
         # Validate mode
@@ -220,7 +215,6 @@ class OrderbookFlowImbalance:
         self._train_interval = train_interval  # milliseconds or snapshots for grouping
         self._dtype = dtype
         self._use_numba = use_numba and HAS_NUMBA
-        self._is_integrated_ofi = is_integrated_ofi
         
         # Extract data from OrderBookData - ensure contiguous arrays for performance
         self._timestamps = np.ascontiguousarray(obData.timestamps, dtype=np.int64)
@@ -247,22 +241,12 @@ class OrderbookFlowImbalance:
         self._grid_start_time = None
         self._grid_end_time = None
         
-        # Integrated OFI information
-        self._integrated_ofi_outsample = None  # Using previous group's PC
-        self._integrated_ofi_insample = None   # Using current group's PC
-        self._pca_w1 = None  # Principal component vectors for each group
-        self._pca_explained_variance = None  # Explained variance for each group
-        
         # Compute OFI
         self._compute_ofi()
         
         # Compute grouping if train_interval is specified
         if self._train_interval is not None:
             self._compute_groups()
-            
-            # Compute integrated OFI if requested
-            if self._is_integrated_ofi:
-                self._compute_integrated_ofi()
         
         # Log summary
         unit = "ms" if mode == 'time_driven' else "snapshots"
@@ -442,19 +426,9 @@ class OrderbookFlowImbalance:
         # Recompute
         self._compute_ofi()
         
-        # Reset integrated OFI
-        self._integrated_ofi_outsample = None
-        self._integrated_ofi_insample = None
-        self._pca_w1 = None
-        self._pca_explained_variance = None
-        
         # Recompute grouping if train_interval is specified
         if self._train_interval is not None:
             self._compute_groups()
-            
-            # Recompute integrated OFI if requested
-            if self._is_integrated_ofi:
-                self._compute_integrated_ofi()
         
         # Log summary
         unit = "ms" if self._mode == 'time_driven' else "snapshots"
@@ -631,240 +605,4 @@ class OrderbookFlowImbalance:
         
         return left_index, right_index
     
-    def _compute_integrated_ofi(self):
-        """
-        Compute integrated OFI using PCA on each group's OFI vectors.
-        
-        For each group:
-        1. Perform PCA/SVD on the group's OFI vectors
-        2. Extract the first principal component (normalized)
-        3. Compute both in-sample and out-of-sample integrated OFI:
-           - Out-of-sample: Use previous group's PC (first group set to 0)
-           - In-sample: Use current group's PC
-        """
-        if self._groups is None:
-            raise ValueError("Cannot compute integrated OFI without grouping. Set train_interval.")
-        
-        n_groups = self.num_groups
-        if n_groups == 0:
-            return
-        
-        # Initialize storage
-        self._integrated_ofi_outsample = np.zeros(self._num_samples, dtype=self._dtype)
-        self._integrated_ofi_insample = np.zeros(self._num_samples, dtype=self._dtype)
-        self._pca_w1 = []
-        self._pca_explained_variance = []
-        
-        # Process each group
-        for group_id in range(n_groups):
-            # Get OFI vectors for this group
-            group_mask = self._groups == group_id
-            group_indices = np.where(group_mask)[0]
-            
-            if len(group_indices) == 0:
-                # Empty group
-                self._pca_w1.append(np.zeros(self._num_levels, dtype=self._dtype))
-                self._pca_explained_variance.append(0.0)
-                continue
-            
-            group_ofi = self._ofi[group_indices]  # shape: (n_samples_in_group, n_levels)
-            
-            # Perform PCA using SVD
-            # Center the data
-            mean_ofi = np.mean(group_ofi, axis=0)
-            centered_ofi = group_ofi - mean_ofi
-            
-            if len(group_indices) < 2:
-                # Not enough samples for PCA
-                self._pca_w1.append(np.zeros(self._num_levels, dtype=self._dtype))
-                self._pca_explained_variance.append(0.0)
-                continue
-            
-            # SVD decomposition
-            try:
-                U, S, Vt = np.linalg.svd(centered_ofi, full_matrices=False)
-                
-                # First principal component (normalized with L1 norm)
-                pc1 = Vt[0]  # First row of Vt
-                pc1 = pc1 / np.sum(np.abs(pc1))  # L1 normalization
-                
-                # Explained variance ratio
-                total_variance = np.sum(S**2)
-                if total_variance > 0:
-                    explained_var = (S[0]**2) / total_variance
-                else:
-                    explained_var = 0.0
-                
-                self._pca_w1.append(pc1)
-                self._pca_explained_variance.append(explained_var)
-                
-            except np.linalg.LinAlgError:
-                # SVD failed
-                self._pca_w1.append(np.zeros(self._num_levels, dtype=self._dtype))
-                self._pca_explained_variance.append(0.0)
-                continue
-            
-            # Compute integrated OFI for this group
-            # In-sample: Use current group's principal component
-            if len(self._pca_w1) > group_id:  # Make sure we have the PC
-                current_pc1 = self._pca_w1[group_id]
-                for idx in group_indices:
-                    self._integrated_ofi_insample[idx] = np.dot(current_pc1, self._ofi[idx])
-            
-            # Out-of-sample: Use previous group's principal component
-            if group_id == 0:
-                # First group: set to 0
-                self._integrated_ofi_outsample[group_indices] = 0.0
-            else:
-                # Use previous group's principal component
-                prev_pc1 = self._pca_w1[group_id - 1]
-                
-                # Compute integrated OFI: pc1_{i-1}^T . ofi_{i,j}
-                for idx in group_indices:
-                    self._integrated_ofi_outsample[idx] = np.dot(prev_pc1, self._ofi[idx])
-        
-        # Convert lists to arrays for easier access
-        self._pca_w1 = np.array(self._pca_w1)
-        self._pca_explained_variance = np.array(self._pca_explained_variance)
-        
-        # Log integrated OFI info
-        print(f"Integrated OFI computed: {n_groups} groups, "
-              f"mean explained variance: {np.mean(self._pca_explained_variance):.3f}")
     
-    def get_integrated_ofi_outsample_at(self, i: int) -> Tuple[float, int]:
-        """
-        Get out-of-sample integrated OFI value and timestamp at index i.
-        
-        Uses previous group's principal component: pca_w1[i-1]^T · ofi[i][j]
-        
-        Parameters
-        ----------
-        i : int
-            Index of the sample
-            
-        Returns
-        -------
-        integrated_ofi : float
-            Out-of-sample integrated OFI value at index i
-        timestamp : int
-            Timestamp in milliseconds at index i
-        """
-        if self._integrated_ofi_outsample is None:
-            raise ValueError("Integrated OFI not computed. Set is_integrated_ofi=True.")
-        
-        if i < 0 or i >= self._num_samples:
-            raise IndexError(f"Index {i} out of range [0, {self._num_samples})")
-        
-        return float(self._integrated_ofi_outsample[i]), self._timestamps[i]
-    
-    def get_integrated_ofi_insample_at(self, i: int) -> Tuple[float, int]:
-        """
-        Get in-sample integrated OFI value and timestamp at index i.
-        
-        Uses current group's principal component: pca_w1[i]^T · ofi[i][j]
-        
-        Parameters
-        ----------
-        i : int
-            Index of the sample
-            
-        Returns
-        -------
-        integrated_ofi : float
-            In-sample integrated OFI value at index i
-        timestamp : int
-            Timestamp in milliseconds at index i
-        """
-        if self._integrated_ofi_insample is None:
-            raise ValueError("Integrated OFI not computed. Set is_integrated_ofi=True.")
-        
-        if i < 0 or i >= self._num_samples:
-            raise IndexError(f"Index {i} out of range [0, {self._num_samples})")
-        
-        return float(self._integrated_ofi_insample[i]), self._timestamps[i]
-    
-    def get_group_integrated_ofi_outsample(self, group_id: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get all out-of-sample integrated OFI values and timestamps for a specific group.
-        
-        Uses previous group's principal component: pca_w1[i-1]^T · ofi[i][j]
-        
-        Parameters
-        ----------
-        group_id : int
-            Group number (0-indexed)
-            
-        Returns
-        -------
-        integrated_ofi_values : ndarray
-            Out-of-sample integrated OFI values for the group, shape (n_samples_in_group,)
-        timestamps : ndarray
-            Timestamps for the group
-        """
-        if self._integrated_ofi_outsample is None:
-            raise ValueError("Integrated OFI not computed. Set is_integrated_ofi=True.")
-        
-        if self._groups is None:
-            raise ValueError("No grouping computed. Set train_interval to enable grouping.")
-        
-        # Find samples in this group
-        mask = self._groups == group_id
-        group_indices = np.where(mask)[0]
-        
-        if len(group_indices) == 0:
-            return np.array([]), np.array([])
-        
-        return self._integrated_ofi_outsample[group_indices], self._timestamps[group_indices]
-    
-    def get_group_integrated_ofi_insample(self, group_id: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get all in-sample integrated OFI values and timestamps for a specific group.
-        
-        Uses current group's principal component: pca_w1[i]^T · ofi[i][j]
-        
-        Parameters
-        ----------
-        group_id : int
-            Group number (0-indexed)
-            
-        Returns
-        -------
-        integrated_ofi_values : ndarray
-            In-sample integrated OFI values for the group, shape (n_samples_in_group,)
-        timestamps : ndarray
-            Timestamps for the group
-        """
-        if self._integrated_ofi_insample is None:
-            raise ValueError("Integrated OFI not computed. Set is_integrated_ofi=True.")
-        
-        if self._groups is None:
-            raise ValueError("No grouping computed. Set train_interval to enable grouping.")
-        
-        # Find samples in this group
-        mask = self._groups == group_id
-        group_indices = np.where(mask)[0]
-        
-        if len(group_indices) == 0:
-            return np.array([]), np.array([])
-        
-        return self._integrated_ofi_insample[group_indices], self._timestamps[group_indices]
-    
-    @property
-    def integrated_ofi_outsample(self) -> Optional[np.ndarray]:
-        """Return computed out-of-sample integrated OFI values (using previous group's PC)."""
-        return self._integrated_ofi_outsample
-    
-    @property
-    def integrated_ofi_insample(self) -> Optional[np.ndarray]:
-        """Return computed in-sample integrated OFI values (using current group's PC)."""
-        return self._integrated_ofi_insample
-    
-    @property
-    def pca_w1(self) -> Optional[np.ndarray]:
-        """Return principal component vectors for each group."""
-        return self._pca_w1
-    
-    @property
-    def pca_explained_variance(self) -> Optional[np.ndarray]:
-        """Return explained variance ratios for each group's first PC."""
-        return self._pca_explained_variance
