@@ -503,22 +503,27 @@ class OrderbookFlowImbalance:
         Returns
         -------
         group : int or None
-            Group number (0-indexed), or None if timestamp is out of range
+            Group number (0-indexed), or None if timestamp is before the first group.
+            Returns last_group + 1 if timestamp is after the last group.
         """
         if self._groups is None:
             raise ValueError("No grouping computed. Set train_interval to enable grouping.")
         
         if self._mode == 'time_driven':
             # For time-driven, use the time grid
-            if timestamp < self._grid_start_time or timestamp >= self._grid_end_time:
+            if timestamp < self._grid_start_time:
                 return None
+            if timestamp >= self._grid_end_time:
+                # Return last group + 1
+                return self.num_groups if self.num_groups > 0 else None
             group = (timestamp - self._grid_start_time) // self._train_interval
             return int(group)
         else:
             # For event-driven, find the sample index first
             idx = np.searchsorted(self._timestamps, timestamp, side='left')
             if idx >= self._num_samples:
-                return None
+                # Return last group + 1
+                return int(self._groups[-1] + 1) if self._num_samples > 0 else None
             # If exact match or within tolerance
             if idx < self._num_samples and abs(self._timestamps[idx] - timestamp) < 1:
                 return int(self._groups[idx])
