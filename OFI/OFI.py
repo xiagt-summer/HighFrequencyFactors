@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OrderbookFlowImbalance - Optimized Version
+OFI - Optimized Version
 ==========================================
 
 High-performance Order Flow Imbalance (OFI) calculation for orderbook data.
@@ -8,7 +8,7 @@ Optimized with vectorized operations, pre-computed boundaries, and optional numb
 
 Classes
 -------
-OrderbookFlowImbalance : Compute OFI from OrderBookData
+OFI : Compute OFI from OrderBookData
     Calculates per-level OFI values over time windows with optimized performance.
 """
 
@@ -158,7 +158,7 @@ def _compute_ofi_vectorized_numpy(
     return ofi_result
 
 
-class OrderbookFlowImbalance:
+class OFI:
     """
     Optimized Order Flow Imbalance (OFI) calculator with performance enhancements.
     
@@ -191,7 +191,7 @@ class OrderbookFlowImbalance:
     Examples
     --------
     >>> ob = OrderBookData('BTCUSDT.csv.gz', numLevels=10)
-    >>> ofi = OrderbookFlowImbalance(ob, mode='time_driven', lookback_interval=1000)
+    >>> ofi = OFI(ob, mode='time_driven', lookback_interval=1000)
     >>> ofi_values = ofi.ofi_vectors
     """
     
